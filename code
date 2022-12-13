@@ -1,0 +1,154 @@
+
+library(survival)
+library(survminer)
+rt=read.table("Time.txt", header=T, sep="\t", check.names=F, row.names=1)
+for(i in colnames(rt[,3:ncol(rt)])){
+    data=rt[,c("futime", "fustat", i)]
+    colnames(data)=c("futime", "fustat", "gene")
+    res.cut=surv_cutpoint(data, time = "futime", event = "fustat", variables =c("gene"))
+    res.cat=surv_categorize(res.cut)
+    diff=survdiff(Surv(futime, fustat) ~gene,data =res.cat)
+    pValue=1-pchisq(diff$chisq, df=1)
+    if(pValue<0.001){
+      pValue="p<0.001"
+    }else{
+      pValue=paste0("p=",sprintf("%.03f",pValue))
+    }
+    fit=survfit(Surv(futime, fustat) ~gene, data = res.cat)
+    surPlot=ggsurvplot(fit,
+                       data=res.cat,
+                       pval=pValue,
+                       pval.size=6,
+                       legend.title=i,
+                       legend.labs=c("high","low"),
+                       xlab="Time(years)",
+                       palette=c("red", "blue"),
+                       break.time.by=1,
+                       conf.int=F,
+                       risk.table=TRUE,
+                       risk.table.title="",
+                       risk.table.height=.25)
+    pdf(file=paste0("survival.",i,".pdf"), onefile=FALSE, width=6, height =5)
+    print(surPlot)
+    dev.off()
+  }
+}
+
+
+library("WGCNA")          
+library("limma")            
+rt=read.table("PanCKCD45.txt",sep="\t",header=T,check.names=F)
+rt=as.matrix(rt)
+rownames(rt)=rt[,1]
+exp=rt[,2:ncol(rt)]
+dimnames=list(rownames(exp),colnames(exp))
+data=matrix(as.numeric(as.matrix(exp)),nrow=nrow(exp),dimnames=dimnames)
+data=avereps(data)
+data=log2(data+1)       
+data=normalizeBetweenArrays(data)
+data=data[apply(data,1,sd)>0.5,]   
+sample1=read.table("sample1.txt" ,sep="\t",header=F,check.names=F)
+sample2=read.table("sample2.txt",sep="\t",header=F,check.names=F)
+conData=data[,as.vector(sample1[,1])]
+treatData=data[,as.vector(sample2[,1])]
+data=cbind(conData,treatData)
+PanCKCount=ncol(conData)
+CD45Count=ncol(treatData)
+datExpr0=t(data)
+gsg = goodSamplesGenes(datExpr0, verbose = 3)
+if (!gsg$allOK)
+{
+  if (sum(!gsg$goodGenes)>0)
+    printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")))
+  if (sum(!gsg$goodSamples)>0)
+    printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")))
+  datExpr0 = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+sampleTree = hclust(dist(datExpr0), method = "average")
+par(cex = 0.6)
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+abline(h = 20000, col = "red")
+clust = cutreeStatic(sampleTree, cutHeight = 20000, minSize = 10)
+table(clust)
+keepSamples = (clust==1)
+datExpr0 = datExpr0[keepSamples, ]
+traitData=data.frame(PanCK=c(rep(1,PanCKCount),rep(0,CD45Count)),
+                     CD45=c(rep(0,PanCKCount),rep(1,CD45Count)))
+row.names(traitData)=colnames(data)
+fpkmSamples = rownames(datExpr0)
+traitSamples =rownames(traitData)
+sameSample=intersect(fpkmSamples,traitSamples)
+datExpr0=datExpr0[sameSample,]
+datTraits=traitData[sameSample,]
+sampleTree2 = hclust(dist(datExpr0), method = "average")
+traitColors = numbers2colors(datTraits, signed = FALSE)
+plotDendroAndColors(sampleTree2, traitColors,
+                    groupLabels = names(datTraits),
+                    main = "Sample dendrogram and trait heatmap")
+enableWGCNAThreads()  
+powers = c(1:20)       
+sft = pickSoftThreshold(datExpr0, powerVector = powers, verbose = 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red")
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+softPower =sft$powerEstimate 
+adjacency = adjacency(datExpr0, power = softPower)
+TOM = TOMsimilarity(adjacency)
+dissTOM = 1-TOM
+geneTree = hclust(as.dist(dissTOM), method = "average");
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04)
+minModuleSize = 50      
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize);
+dynamicColors = labels2colors(dynamicMods)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+MEList = moduleEigengenes(datExpr0, colors = dynamicColors)
+MEs = MEList$eigengenes
+MEDiss = 1-cor(MEs);
+METree = hclust(as.dist(MEDiss), method = "average")
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+merge = mergeCloseModules(datExpr0, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+plotDendroAndColors(geneTree, mergedColors,"Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+moduleColors = mergedColors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+nGenes = ncol(datExpr0)
+nSamples = nrow(datExpr0)
+moduleTraitCor = cor(MEs, datTraits, use = "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(5, 10, 3, 3))
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5,
+               zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
