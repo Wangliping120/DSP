@@ -1,3 +1,303 @@
+library(ggplot2)
+library(pheatmap)
+library(reshape2)
+library(ggpubr)
+
+library(getopt)
+
+spec = matrix(
+  c('help','h',0,'logical',
+    'input','i',1,'character',
+    'case','a',1,'character',
+    'control','b',1,'character',
+    'gcase','ga',1,'character',
+    'gcontrol','gb',1,'character',
+    'outdir','o',1,'character',
+    'foldchange','fc',1,'numeric',
+    'pvalue','p',1,'numeric',
+    'anno','an',1,'character',
+	'diff_paired','dp',1,'logical',
+	'testMethod','me',1,'character'
+  ),
+  byrow = TRUE,
+  ncol = 4
+)
+
+opt = getopt(spec)
+
+print_usage <- function(spec=NULL){
+  cat(getopt(spec, usage=TRUE));
+  cat("Usage example: \n")
+  cat("
+      Usage example:
+      /mnt/icfs/work/singlecelldevelopment/miniconda3/envs/NanoString/bin/Rscript cal_diff.R --input [matrix] --case [case sample] --control [control sample] --gcase [case group] --gcontrol [control group] --outdir output dir
+     --input:      expression matrix
+     --case:       case sample, separated by ":"
+     --control:    control sample, separated by ":"
+     --gcase:      case groupname
+     --gcontrol:   control groupname
+	 --diff_paired paired analysis
+	 --testMethod  ttest,anova,wilcox
+     --outdir:     output dir
+     --foldchange
+     --pvalue
+  \n")
+  q(status=1);
+}
+
+
+if (!is.null(opt$help)) {
+  print_usage(spec)
+}
+
+inputfile <- opt$input
+case <- opt$case
+control <- opt$control
+gcase <- opt$gcase
+gcontrol <- opt$gcontrol
+od <- opt$outdir
+annodir <- opt$anno
+diff_paired <- opt$diff_paired
+testMethod <- opt$testMethod
+
+if(!is.null(opt$foldchange)){
+  foldchange <- opt$foldchange
+}else{
+  foldchange <- 2
+}
+
+if(!is.null(opt$pvalue)){
+  pvalue <- opt$pvalue
+}else{
+  pvalue <- 0.05
+}
+
+od1 <- paste(od, paste(gcase, "_vs_", gcontrol, sep = ""), sep="/")
+if(!dir.exists(od1)){
+  dir.create(od1,recursive = TRUE)
+}
+
+od2 <- paste(od1, "top_diffgenes_boxplot", sep="/")
+
+if(!dir.exists(od2)){
+#  dir.create(od2, recursive = TRUE)
+}
+
+gene.anno1 <- read.delim(paste(annodir,"back.anno.xls",sep="/"),header=T,sep="\t",comment.char = "#",check.names=F)
+gene.anno2 <- read.table(paste(annodir,"/back",sep="/"),comment.char = "",skip=1,header=T,check.names=F)
+colnames(gene.anno2) <- c("Query", "gene_ID", "gene", "gene_biotype", "version", "chr","strand", "start", "end","length")
+
+tmp <- NULL
+tmp <- apply(gene.anno2,1,function(x){
+        if (x[3]=='-') {x[3]=x[2]}
+        x
+})
+gene.anno2 <- as.data.frame(t(tmp))
+gene.anno2$Gene <- c()
+anno <- merge(gene.anno2, gene.anno1, by="Query", all = TRUE)
+
+diff <- data.frame()
+
+exp_matrix <- read.table(inputfile, header = T, sep = "\t", check.names = F, stringsAsFactors=FALSE)
+
+case_sample = strsplit(case, ":")[[1]]
+control_sample = strsplit(control, ":")[[1]]
+
+data <- exp_matrix[,c("Gene", case_sample, control_sample)]
+
+options(scipen=999)
+
+for(i in c(1:nrow(exp_matrix))){
+#  obj <- try(t.test(as.numeric(exp_matrix[i, case_sample]), as.numeric(exp_matrix[i, control_sample]), mu=2000), silent=TRUE)
+  if(testMethod=='anova'){
+	tmp.data <- data.frame(y=as.numeric(unlist(exp_matrix[i,c(case_sample,control_sample)])),group=c(rep('case',times=length(case_sample)),rep('control',times=length(control_sample))))
+	tryCatch({tmp.avo<-summary(aov(y~group,tmp.data))
+				pval<-tmp.avo[[1]]['group','Pr(>F)']},
+				error=function(e){
+				pval<-NA
+				}
+			) 
+  }
+  if(testMethod=='ttest'){
+	obj <- try(t.test(as.numeric(unlist(exp_matrix[i, case_sample])), as.numeric(unlist(exp_matrix[i, control_sample])), paired=diff_paired), silent=TRUE)
+	if (is(obj, "try-error")){
+		pval <- "NA"
+	}else{
+		pval <- obj$p.value
+	}
+  }
+  if(testMethod=='wilcox'){
+	obj <- try(wilcox.test(as.numeric(unlist(exp_matrix[i, case_sample])), as.numeric(unlist(exp_matrix[i, control_sample])),paired=diff_paired), silent=TRUE)
+	if (is(obj, "try-error")){
+		pval <- "NA"
+	}else{
+		pval <- obj$p.value
+	}
+  
+  }
+  
+  log2FC <- log(mean(as.numeric(as.character(unlist(exp_matrix[i, case_sample]))))/mean(as.numeric(as.character(unlist(exp_matrix[i, control_sample])))), 2)
+  tmp <- data.frame(log2FC, pval)
+  diff <- rbind(diff, tmp)
+}
+
+diff_result <- data.frame(Gene = exp_matrix$Gene, exp_matrix[,case_sample], exp_matrix[,control_sample])
+
+if(length(case_sample) > 1){
+  diff_result$Case_Mean <- rowMeans(exp_matrix[,case_sample])
+}else{
+  diff_result$Case_Mean <- exp_matrix[,case_sample]
+}
+
+if(length(control_sample) > 1 ){
+  diff_result$Control_Mean = rowMeans(exp_matrix[,control_sample])
+}else{
+  diff_result$Control_Mean = exp_matrix[,control_sample]
+}
+
+diff_result$log2FC = as.numeric(unlist(diff[,1]))
+diff_result$pval = as.numeric(unlist(diff[,2]))
+
+if(length(case_sample) >1 & length(control_sample) >1){
+  diff_result <- diff_result[order(diff_result$pval),]
+  diff_result$fdr <- p.adjust(as.numeric(as.vector(diff_result$pval)),method = "fdr")
+}else{
+  diff_result <- diff_result[order(diff_result$log2FC, decreasing = T),]
+  colnames(diff_result) <- c("Gene", case_sample, control_sample, "Case_Mean", "Control_Mean", "log2FC", "pval")
+  diff_result$fdr <- "NA"
+}
+
+
+diff_result <- merge(diff_result, anno, by.x = "Gene", by.y = "gene", all.x=TRUE)
+
+write.table(diff_result, paste(od1, paste(gcase, "_vs_", gcontrol, "_ALL_result.xls", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+
+
+if(length(case_sample) >1 & length(control_sample) >1){
+  deg_result <- diff_result[which(diff_result$pval <= pvalue & abs(diff_result$log2FC) >= log2(foldchange)), ]
+  up_result <- diff_result[which(diff_result$pval <= pvalue & diff_result$log2FC >= log2(foldchange)), ]
+  down_result <- diff_result[which(diff_result$pval <= pvalue & diff_result$log2FC <= -log2(foldchange)), ]
+}else{
+  deg_result <- diff_result[which(abs(diff_result$log2FC) >= log2(foldchange)), ]
+  up_result <- diff_result[which(diff_result$log2FC >= log2(foldchange)), ]
+  down_result <- diff_result[which(diff_result$log2FC <= -log2(foldchange)), ]
+}
+
+write.table(deg_result, paste(od1, paste(gcase, "_vs_", gcontrol, "_DEG_result.xls", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+write.table(up_result, paste(od1, paste(gcase, "_vs_", gcontrol, "_UP_result.xls", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+write.table(down_result, paste(od1, paste(gcase, "_vs_", gcontrol, "_DOWN_result.xls", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+
+deg_list <- data.frame(GeneID = deg_result$Query, Symbol = deg_result$Gene)
+write.table(deg_list, paste(od1, paste(gcase, "_vs_", gcontrol, "_DEGlist.txt", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+
+up_list <- data.frame(GeneID = up_result$Query, Symbol = up_result$Gene)
+write.table(up_list, paste(od1, paste(gcase, "_vs_", gcontrol, "_UPlist.txt", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+
+down_list <- data.frame(GeneID = down_result$Query, Symbol = down_result$Gene)
+write.table(down_list, paste(od1, paste(gcase, "_vs_", gcontrol, "_DOWNlist.txt", sep = ""), sep = "/"), row.names = F, col.names = T, quote = F, sep = "\t")
+#heatmap
+
+union <- data[(data$Gene %in% deg_list$Symbol),]
+
+#h_cluster
+rownames(union)<-union[,1]
+union<-union[,-1]
+union<-log10(union + 1)
+
+if(length(union[1,])<=10){
+        cell_widths=36
+        cell_width=34
+}else{
+        cell_widths=floor(360/length(union[1,]))
+        cell_width=floor(300/length(union[1,]))
+}
+num=length(union[,1])
+
+if(dim(union)[2]==2){
+        scale_row_col="column"
+}else{
+        scale_row_col="row"
+}
+
+#pdf(paste(od1, "Hcluster_heatmap.pdf", sep = "/"), height=0.01 * num+8, width=6, onefile=FALSE)
+pdf(paste(od1, "Hcluster_heatmap.pdf", sep = "/"), height=0.05 * num+8, width=6, onefile=FALSE)
+pheatmap(union, color=colorRampPalette(rev(c("red","white","blue")))(100), cluster_cols=T, cluster_rows=T, scale='row', legend=T, show_rownames=TRUE, fontsize_row=3, fontsize_col=3, cellwidth=cell_width, main = paste(gcase, "_vs_", gcontrol, sep = ""))
+dev.off()
+
+png(paste(od1, "Hcluster_heatmap.png", sep = "/"), type="cairo-png", width=480, height=480)
+pheatmap(union, color=colorRampPalette(rev(c("red","white","blue")))(100), cluster_cols=T, cluster_rows=T, scale='row', legend=T, show_rownames=FALSE, cellwidth=cell_widths, fontsize_col = 4, main = paste(gcase, "_vs_", gcontrol, sep = ""))
+dev.off()
+
+#volcano plot
+
+library(ggrepel)
+
+diff_result$threshold <- "NoSignificant"
+if(length(case_sample) >1 & length(control_sample) >1){
+  diff_result[which(diff_result$pval < pvalue & diff_result$log2FC>= log2(foldchange)), "threshold"] <- "Up"
+  diff_result[which(diff_result$pval < pvalue & diff_result$log2FC<= -log2(foldchange)), "threshold"] <- "Down"
+
+#diff_result$threshold = factor(ifelse(diff_result$pval < pvalue, ifelse(diff_result$log2FC>= 0 ,'Up','Down'),'NoSignificant'),levels=c('Up','Down','NoSignificant'))
+
+  diff_result2 <- na.omit(diff_result)
+
+  diff_result2$pval <- as.numeric(unlist(diff_result2$pval))
+
+  vol <- ggplot(diff_result2, aes(x = log2FC, y = -1 *log10(pval), color = threshold))+
+              geom_point()+
+              scale_color_manual(values = c("Up"="#DC143C", "Down"="#00CD66", "NoSignificant"="#808080"))+
+#              geom_text_repel(
+#                data = diff_result2[which(diff_result2$pval <= pvalue & abs(diff_result$log2FC) >= log2(foldchange)),],
+#                aes(label = Gene),
+#                size = 3,
+#                segment.color = "black", show.legend = FALSE )+
+              labs(title = paste(gcase, "_vs_", gcontrol, sep = ""), y = "-log10 (pval)", x = "log2 (FoldChange)") +
+              theme_bw()+
+              theme(
+                plot.title = element_text(hjust = 0.5),
+                legend.title = element_blank(),
+                panel.grid=element_blank()
+              )+
+#              ylab('-log10 (pval)')+
+#              xlab('log2 (FoldChange)')+
+              xlim(-5,5) +
+              geom_hline(yintercept = -log10(pvalue),  lty=3, col="black", lwd=0.5) + 
+              geom_vline(xintercept = c(-log2(foldchange), log2(foldchange)), lty=3, col="black", lwd=0.5)
+
+pdf(paste(od1, "Volcano_plot.pdf", sep = "/"), height =4, width = 6)
+print(vol)
+dev.off()
+
+png(paste(od1, "Volcano_plot.png", sep = "/"), type="cairo-png",  height = 360, width = 480)
+print(vol)
+dev.off()
+}
+
+#boxplot
+
+dat_long <- melt(data[(data$Gene %in% deg_list$Symbol),])
+dat_long$group <- "group"
+dat_long[dat_long$variable %in% control_sample,]$group <- gcontrol
+dat_long[dat_long$variable %in% case_sample,]$group <- gcase
+
+colnames(dat_long) <- c("Gene", "Sample", "value", "Group")
+
+if(length(deg_list$Symbol) > 20){
+  box_gene <- deg_list$Symbol[1:20]
+}else{
+  box_gene <- deg_list$Symbol
+}
+
+for(i in box_gene){
+  box_input <- dat_long[dat_long$Gene == i,]
+  ymax <- max(box_input$value)
+
+  bp <- ggplot(data = box_input, aes(x = Group, y = value)) + geom_boxplot(position=position_dodge(1), outlier.shape = NA, width=0.5) + coord_cartesian(ylim=c(0, 1.1 * ymax ))  + geom_point(size=2, aes(colour = Group),  position = position_jitter(width = 0.2, height=0)) + stat_compare_means(aes(group = Group), method = "wilcox.test", label= "p.format", label.y=1.05 * ymax)  + ggtitle(i)  + xlab(NULL) + ylab(NULL) + theme_bw() + theme(panel.grid = element_blank(),  plot.title = element_text(hjust = 0.5), axis.text.x=element_text(hjust=1, vjust=1, size=15), axis.text.y=element_text(size=15))
+
+#  pdf(paste(od2, paste(i, "_exp_boxplot.pdf", sep = ""), sep = "/"), height = 4, width=5)
+#  print(bp)
+#  dev.off()
+}
 
 library(survival)
 library(survminer)
@@ -152,3 +452,337 @@ labeledHeatmap(Matrix = moduleTraitCor,
                cex.text = 0.5,
                zlim = c(-1,1),
                main = paste("Module-trait relationships"))
+
+
+# opt <- list()
+# opt$organism <- "mmu"
+# opt$geneFile <- '/lustre/analysis/microarray/bioinfo-RNA-pro/6.test/kunbang/R/Investigation/work/t_20200304/graphclust/Cluster1/Cluster1.gene.txt'
+# opt$type <- 'Reactome'
+# opt$outPath <-  getwd()
+# opt$color <- 'pvalue'  # one of ’pvalue’, ’p.adjust’, ’qvalue’
+
+library(getopt)
+
+spec = matrix(c(
+  'help',     'h', 0, 'logical',
+  'organism', 'r', 1, 'character',
+  'geneFile', 'f', 1, 'character',
+  'type',     't', 1, 'character',
+  'outPath',  'o', 1, 'character',
+  'color',    'c', 1, 'character'
+), byrow = TRUE, ncol = 4)
+opt = getopt(spec)
+
+if (!is.null(opt$help)) {
+  cat(getopt(spec, usage = TRUE))
+  q(status = 1)
+}
+if (is.null(opt$organism)) {
+  cat(getopt(spec, usage = TRUE))
+  stop("!!! No organism parameter.")
+} else if (is.null(opt$geneFile)) {
+  cat(getopt(spec, usage = TRUE))
+  stop("!!! No geneFile parameter.")
+} else if (is.null(opt$type)) {
+  cat(getopt(spec, usage = TRUE))
+  stop("!!! No type parameter.")
+} else if (is.null(opt$outPath)) {
+  cat(getopt(spec, usage = TRUE))
+  stop("!!! No outPath parameter.")
+}
+
+if(!dir.exists(opt$outPath)){
+  dir.create(opt$outPath, recursive = TRUE)
+}
+
+if (is.null(opt$color)) {
+  opt$color <- 'p.adjust'
+}
+
+# print parameters
+cat("\n===========================================================\n")
+cat("opt <- list()\n")
+cat(paste0('opt$geneFile <- "',opt$geneFile, '"\n'))
+cat(paste0('opt$type <- "',opt$type, '"\n'))
+cat(paste0('opt$organism <- "',opt$organism, '"\n'))
+cat(paste0('opt$outPath <- "',opt$outPath, '"\n'))
+cat(paste0('opt$color <- "',opt$color, '"\n'))
+cat("===========================================================\n\n\n")
+
+
+
+#library(topGO)
+library(pathview)
+library(ggrepel)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(cowplot)
+library(ReactomePA)
+
+
+####- visual function
+Visual_base <- function(GeneInfo, Type, Organism, Organism_2, OrgDb, OutPath, Color){
+	geneFC <- GeneInfo$log2FC
+	if(Type == 'KEGG'){
+		DB <- 'KEGG'
+		OutPath <- paste(OutPath,DB,sep='/')
+		names(geneFC) <- GeneInfo$ENTREZID
+		#---- KEGG
+		erich_object <- enrichKEGG(gene = GeneInfo$ENTREZID,
+						organism = Organism,       # supported organism listed in  http://www.genome.jp/kegg/catalog/org_list.html
+						keyType = "kegg",       # one of "kegg", "ncbi-geneid",  "ncib-proteinid" and "uniprot"
+						pvalueCutoff = 1,
+						qvalueCutoff = 1, 
+						pAdjustMethod = "BH", 
+						minGSSize = 1,         # minimal size of genes annotated by Ontology term for testing.
+						maxGSSize = 500, 
+						use_internal_data = T   #  use KEGG.db or latest online KEGG data
+						)
+		End <- c()
+		for(IDs in strsplit(erich_object$geneID,'/',fixed=T)){
+			Colors <- ifelse(geneFC[IDs] > 0,'red','blue')
+			End <- c(End,paste(paste0('hsa:',names(Colors),'%09',Colors),collapse='/'))
+		}
+		Hyperlink <- paste0('http://www.genome.jp/kegg-bin/show_pathway?',erich_object$ID,'/',End)
+		zscore <- c()
+		for(geneid in strsplit(erich_object@result$geneID,'/')){
+			LogFC <- GeneInfo[which(GeneInfo$ENTREZID %in% geneid),'log2FC']
+			zscore <- c(zscore,(length(LogFC[LogFC>0]) - length(LogFC[LogFC<0])) / sqrt(length(LogFC)))
+		}
+		erich_object@result$zscore <- zscore
+		erich_object@result$FoldEnrichment <- unlist(apply(erich_object@result, 1 ,function(x) { eval(parse(text=x[3]))/eval(parse(text=x[4]))} ))
+		erich_object@result$Hyperlink <- Hyperlink
+		erich_object <- setReadable(erich_object, OrgDb=OrgDb, keyType='ENTREZID')
+		
+	}else if(Type == 'Reactome'){
+                #---- Reactome
+		if(Organism_2 == '-') return(paste('========', OutPath, Type))
+                DB <- 'Reactome'
+                OutPath <- paste(OutPath,DB,sep='/')
+                names(geneFC) <- GeneInfo$Gene
+                erich_object <- enrichPathway(gene = GeneInfo$ENTREZID,
+                                                organism = Organism_2,     #  one of "human", "rat", "mouse", "celegans", "yeast","zebrafish", "fly". 
+                                                pvalueCutoff = 1,
+                                                qvalueCutoff = 1,
+                                                pAdjustMethod = "BH",
+                                                minGSSize = 1,         # minimal size of genes annotated by Ontology term for testing.
+                                                maxGSSize = 500,
+                                                readable = TRUE   #  use KEGG.db or latest online KEGG data
+                                                )
+                Hyperlink <- paste0('http://www.reactome.org/cgi-bin/eventbrowser_st_id?ST_ID=',erich_object$ID)
+                zscore <- c()
+                for(geneid in strsplit(erich_object@result$geneID,'/')){
+                        LogFC <- GeneInfo[which(GeneInfo$Gene %in% geneid),'log2FC']
+                        zscore <- c(zscore,(length(LogFC[LogFC>0]) - length(LogFC[LogFC<0])) / sqrt(length(LogFC)))
+                }
+                erich_object@result$zscore <- zscore
+                erich_object@result$FoldEnrichment <- unlist(apply(erich_object@result, 1 ,function(x) { eval(parse(text=x[3]))/eval(parse(text=x[4]))} ))
+                erich_object@result$Hyperlink <- Hyperlink
+
+        }else if(Type == 'DO'){
+		if(Organism != 'hsa') return('========!!!!   No Disease Ontology   !!!!========')
+		# http://disease-ontology.org/
+		DB <- 'DO'
+		OutPath <- paste(OutPath,'Disease',sep='/')
+#		names(geneFC) <- GeneInfo$ENTREZID
+		erich_object <- DOSE::enrichDO(gene = GeneInfo$ENTREZID,
+						ont = 'DO',
+						pvalueCutoff = 1, 
+						qvalueCutoff = 1, 
+						pAdjustMethod = "BH", 
+						minGSSize = 1,                   # minimal size of genes annotated by Ontology term for testing.
+						maxGSSize = 500,
+						readable = TRUE 
+						)
+                zscore <- c()
+                for(geneid in strsplit(erich_object@result$geneID,'/')){
+                        LogFC <- GeneInfo[which(GeneInfo$Gene %in% geneid),'log2FC']
+                        zscore <- c(zscore,(length(LogFC[LogFC>0]) - length(LogFC[LogFC<0])) / sqrt(length(LogFC)))
+                }
+                erich_object@result$zscore <- zscore
+                erich_object@result$FoldEnrichment <- unlist(apply(erich_object@result, 1 ,function(x) { eval(parse(text=x[3]))/eval(parse(text=x[4]))} ))
+	}else if(Type %in% c('BP','CC','MF')){
+		DB <- 'GO'
+		OutPath <- paste(OutPath,DB,Type,sep='/')
+		names(geneFC) <- GeneInfo$Gene
+		#---- GO 
+		erich_object <- enrichGO(gene = GeneInfo$ENTREZID,
+						OrgDb = OrgDb,
+						keyType = 'ENTREZID',
+						ont = Type,                       # One of "BP", "MF", and "CC" subontologies, or "ALL" for all three.
+						pvalueCutoff = 1, 
+						qvalueCutoff = 1, 
+						pAdjustMethod = "BH", 
+						minGSSize = 1,                   # minimal size of genes annotated by Ontology term for testing.
+						maxGSSize = 500,
+						readable = TRUE 
+						)
+	
+		# simplify output by removing redundancy of enriched GO terms
+		# Yu, Guangchuang, Fei Li, Yide Qin, Xiaochen Bo, Yibo Wu, and Shengqi Wang. 2010. “GOSemSim: An R Package for Measuring Semantic Similarity Among Go Terms and Gene Products.” Bioinformatics 26 (7): 976–78. https://doi.org/10.1093/bioinformatics/btq064.
+		erich_object <- simplify(erich_object)
+		Hyperlink <- paste0('http://amigo.geneontology.org/amigo/term/',erich_object$ID)
+		zscore <- c()
+		for(geneid in strsplit(erich_object@result$geneID,'/')){
+			LogFC <- GeneInfo[which(GeneInfo$Gene %in% geneid),'log2FC']
+			zscore <- c(zscore,(length(LogFC[LogFC>0]) - length(LogFC[LogFC<0])) / sqrt(length(LogFC)))
+		}
+		erich_object@result$zscore <- zscore
+                erich_object@result$FoldEnrichment <- unlist(apply(erich_object@result, 1 ,function(x) { eval(parse(text=x[3]))/eval(parse(text=x[4]))} ))
+		erich_object@result$Hyperlink <- Hyperlink
+
+	}
+	if(is.null(erich_object)) return(paste('======== failed !!!! ', OutPath, Type))
+	
+
+	if(!dir.exists(OutPath)){ dir.create(OutPath, recursive = T) }
+	new_tem_names <- function(term_names){
+		unlist(sapply(
+			term_names,function(x) {
+				if(nchar(x) > 40){
+					spl <- strsplit(x,' |-')[[1]]
+					paste(paste(spl[1:3],collapse=' '),'...',spl[length(spl)])
+				}else{
+					x
+				}
+				}
+			)
+		)
+	}
+
+	OutPath_in <- paste(OutPath,Type,sep='/')
+	term_number <- ifelse(length(erich_object@result$Description) < 30, length(erich_object@result$Description), 30)
+	new_Description <- new_tem_names(erich_object@result$Description[1:term_number])
+	new_labels <- paste(new_Description,erich_object@result$ID[1:term_number],sep=' | ')
+
+	
+	#- barplot
+	p_1 <- barplot(erich_object,
+				x = "Count",         # one of ’Count’ and ’GeneRatio’
+				color = Color,       # one of ’pvalue’, ’p.adjust’, ’qvalue’
+				showCategory = 30,
+				font.size = 12,
+				title = "") + 
+				labs(x='Terms',y='Counts') +
+				scale_x_discrete(labels=new_labels,breaks=erich_object@result$Description[1:term_number])
+				
+	ggsave(paste0(OutPath_in,'.barplot.',Color,'.pdf'),p_1,width=9)
+	ggsave(paste0(OutPath_in,'.barplot.',Color,'.png'),p_1,width=9)
+
+
+	#- dotplot
+	p_2 <- dotplot(erich_object, 
+				x = "GeneRatio",      # variable for x-axis, one of ’GeneRatio’ or ’Count’
+				color = Color,
+				showCategory = 30,    # variable that used to scale the sizes of caterich_objectries
+				font.size = 12, 
+				title = "" ) + 
+				labs(y='Terms') +
+				scale_y_discrete(labels=new_labels,breaks=erich_object@result$Description[1:term_number])
+
+	ggsave(paste0(OutPath_in,'.dotplot.',Color,'.pdf'),p_2,width=10,height=9)
+	ggsave(paste0(OutPath_in,'.dotplot.',Color,'.png'),p_2,width=10,height=9)
+
+
+	# plot induced GO DAG of significant terms
+	if(DB == 'GO'){
+		pdf(paste0(OutPath_in,'.DAG.pdf'))
+		print(plotGOgraph(erich_object,
+					firstSigNodes = 10,
+					useInfo = "all",
+					sigForAll = TRUE,
+					useFullNames = TRUE
+					))
+		dev.off()
+		
+		png(paste0(OutPath_in,'.DAG.png'),width =2000, height = 2000,res=500)
+		print(plotGOgraph(erich_object,
+					firstSigNodes = 10,
+					useInfo = "all",
+					sigForAll = TRUE,
+					useFullNames = TRUE
+					))
+		dev.off()
+	}
+
+
+	# plot linkages of genes and enriched concepts
+	p_3 <- cnetplot(erich_object, showCategory = 5,
+					foldChange=geneFC
+					) + guides(color=guide_colorbar(title='log2FC')) 
+	p_4 <- cnetplot(erich_object,
+					showCategory = 5,
+					foldChange=geneFC,
+					circular = TRUE,
+					colorEdge = TRUE
+					) + theme(legend.position="none")
+	p34 <- cowplot::plot_grid(p_3, p_4, ncol=2, rel_widths=c(1, 0.8))
+	ggsave(paste0(OutPath_in,'.Gene-Term_Network.pdf'),p34,width=15,height=7)
+	ggsave(paste0(OutPath_in,'.Gene-Term_Network.png'),p34,width=15,height=7)
+
+
+	# heatmap
+	p_5 <- heatplot(erich_object, showCategory = 30, foldChange=geneFC) + 
+					labs(y='Terms',x='Genes') +
+					guides(fill=guide_colorbar(title='log2FC')) +
+					scale_y_discrete(labels=new_labels,breaks=erich_object@result$Description[1:term_number])
+
+#	ggsave(paste0(OutPath_in,'.heatmap.pdf'),p_5,width=0.5 * length(geneFC))
+#	ggsave(paste0(OutPath_in,'.heatmap.png'),p_5,width=0.5 * length(geneFC))
+
+
+	# Enrichment Map
+#        erich_object2 <- pairwise_termsim(erich_object)
+	p_6 <- emapplot(erich_object, 
+				showCategory = 10,
+				color = Color,
+				layout = "nicely"
+			#	pie_scale=4
+				)
+	ggsave(paste0(OutPath_in,'.Enrichment_Map.pdf'),p_6)
+	ggsave(paste0(OutPath_in,'.Enrichment_Map.png'),p_6)
+
+	# pathview
+	if(DB == 'KEGG'){
+		P_OutPath <- paste0(OutPath,'/pathview')
+		if(!dir.exists(P_OutPath)){ dir.create(P_OutPath) }
+		oldPath <- getwd()
+		setwd(P_OutPath)
+		for(id in erich_object@result$ID[1:10]){
+			Infs <- geneFC[geneinfo[geneinfo$Gene %in% unlist(strsplit(erich_object@result[id,'geneID'],'/',fixed=T)),'ENTREZID']]
+			try(
+				pathview(gene.data = as.matrix(Infs),
+                                        cpd.idtype = "kegg",
+                                        gene.idtype = "entrez",
+                                        pathway.id = id,
+                                        species = Organism,
+                                        min.nnodes = 1,
+                                        kegg.dir = P_OutPath,
+                                        limit = list(gene=c(-abs(max(Infs)),abs(max(Infs))))
+                                )       
+			)
+		}
+		setwd(oldPath)
+	}
+
+	
+	#- zscore_dotplot
+        zscore_number <- ifelse(length(erich_object@result$zscore) < 10, length(erich_object@result$zscore), 10)
+        p <- ggplot(erich_object@result,aes(x=zscore,y=-log10(eval(parse(text=Color))))) +
+                        geom_point(aes(color = FoldEnrichment,size = Count))+
+                        scale_color_gradient(low = "blue", high = "red")+
+                        labs(x="z-score",y=paste0("-log10(",Color,")"))+
+                        theme_bw() +
+                        geom_text_repel(data=erich_object@result[1:zscore_number,],
+					aes(x=zscore,y=-log10(eval(parse(text=Color))),label=ID))
+
+	ggsave(paste0(OutPath_in,'.zscore_dotplot.pdf'),p)
+        ggsave(paste0(OutPath_in,'.zscore_dotplot.png'),p)
+
+
+	erich_object@result <- erich_object@result[,-7]    
+	erich_object@result$GeneRatio <- paste0(' ',erich_object@result$GeneRatio)
+	erich_object@result$BgRatio <- paste0(' ',erich_object@result$BgRatio)
+	write.table(erich_object@result, paste0(OutPath_in,'_Enrichment_result.xls'),quote=F,row.names=F,col.names=T,sep="\t")
+}
